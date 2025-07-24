@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -30,10 +31,15 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private lateinit var orientationTextView: TextView // Renamed from pitchTextView
     private lateinit var instructionTextView: TextView
     private lateinit var startStopButton: Button
+    private lateinit var safePositionButton: Button
+    private lateinit var riskyPositionButton: Button
+    private lateinit var dataCountTextView: TextView
 
     // --- System Services ---
     private lateinit var sensorManager: SensorManager
     private lateinit var vibrator: Vibrator
+    private lateinit var powerManager: PowerManager
+    private var wakeLock: PowerManager.WakeLock? = null
 
     // --- Sensor Objects ---
     private var accelerometer: Sensor? = null
@@ -64,16 +70,31 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
     private var vibrationHandler: Handler? = null
     private var soundHandler: Handler? = null
     private var toneGenerator: ToneGenerator? = null
+    
+    // --- Data Collection ---
+    private var lastKnownRoll: Float? = null
+    private var lastKnownPitch: Float? = null
+    private var lastKnownAzimuth: Float? = null
+    private val safePositionData = mutableListOf<SensorData>()
+    private val riskyPositionData = mutableListOf<SensorData>()
+    
+    data class SensorData(
+        val roll: Float,
+        val pitch: Float,
+        val azimuth: Float,
+        val timestamp: Long
+    )
 
     // --- Companion Object (Constants) ---
     companion object {
         private const val TAG = "NoSleepApp" // Log Tag
 
-        // Threshold based on ROLL (in radians) to detect "on stomach" position.
-        // Roll ~ 0 rad (0 deg) when screen UP.
-        // Roll ~ 130+ deg when dangerously down on stomach.
-        // Roll ~ 150 deg when completely upside down.
-        private const val STOMACH_ROLL_THRESHOLD_RADIANS = 2.27 // Approx 130 degrees. TUNABLE!
+        // Thresholds based on collected data analysis:
+        // Safe positions: Pitch avg -0.66 rad (more negative = tilted back)
+        // Risky positions: Pitch avg +0.20 rad (positive) + one at -0.42 rad
+        // Threshold set between -0.42 (risky) and -0.66 (safe avg)
+        private const val STOMACH_PITCH_THRESHOLD_RADIANS = -0.5f // Detect when pitch > -0.5 (less tilted back)
+        private const val MAX_SAFE_ROLL_RADIANS = 1.5f // Allow wide roll variation (both datasets overlap)
 
         private const val VIBRATION_INTERVAL_MS: Long = 1500 // 1.5 seconds between vibrations (increased frequency)
         private const val VIBRATION_DURATION_MS: Long = 750 // 0.75 second vibration duration (intermediate)
@@ -92,12 +113,18 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         orientationTextView = findViewById(R.id.orientationTextView) // Use new ID
         instructionTextView = findViewById(R.id.instructionTextView)
         startStopButton = findViewById(R.id.startStopButton)
+        safePositionButton = findViewById(R.id.safePositionButton)
+        riskyPositionButton = findViewById(R.id.riskyPositionButton)
+        dataCountTextView = findViewById(R.id.dataCountTextView)
         orientationTextView.text = "Roll: N/A" // Initial state text
+        
+        updateDataCountDisplay()
 
         // --- Initialize System Services ---
         initSensorManager()
         initVibrator()
         initSound()
+        initPowerManager()
 
         // --- Check Sensor Availability ---
         checkSensorAvailability()
@@ -105,13 +132,21 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         // Enable battery optimization for older devices
         enableBatteryOptimizationForOlderDevices()
 
-        // --- Setup Button Listener ---
+        // --- Setup Button Listeners ---
         startStopButton.setOnClickListener {
             if (!isMonitoring) {
                 startMonitoring()
             } else {
                 stopMonitoring()
             }
+        }
+        
+        safePositionButton.setOnClickListener {
+            collectDataPoint(true) // true = safe position
+        }
+        
+        riskyPositionButton.setOnClickListener {
+            collectDataPoint(false) // false = risky position
         }
     }
 
@@ -136,6 +171,9 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         super.onDestroy()
         stopAllAlerts()
         toneGenerator?.release()
+        // Ensure wake lock is released
+        wakeLock?.release()
+        wakeLock = null
     }
     
     private fun enableBatteryOptimizationForOlderDevices() {
@@ -186,6 +224,10 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             Log.e(TAG, "Failed to initialize ToneGenerator", e)
         }
     }
+    
+    private fun initPowerManager() {
+        powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+    }
 
     private fun checkSensorAvailability() {
         val hasRotationVector = rotationVectorSensor != null
@@ -225,9 +267,20 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             // Reset UI
             statusTextView.text = "Status: Monitoring..."
             startStopButton.text = "Stop Monitoring"
-            instructionTextView.text = "Monitoring active. Screen will turn off to save battery."
-            // Allow screen to turn off for battery saving
-            // window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON) // Commented out for battery optimization
+            instructionTextView.text = "Monitoring active. Screen will stay on for reliable alerts."
+            
+            // Acquire wake lock to keep CPU active for sensors when screen is off
+            // Use PARTIAL_WAKE_LOCK with ACQUIRE_CAUSES_WAKEUP for older Android versions
+            wakeLock = powerManager.newWakeLock(
+                PowerManager.PARTIAL_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP, 
+                "NoSleepApp:SensorMonitoring"
+            )
+            wakeLock?.acquire(10*60*60*1000L /*10 hours*/) // Max 10 hours for safety
+            
+            // Also keep screen on as fallback for battery-critical monitoring
+            window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+            
+            Log.i(TAG, "Wake lock acquired with screen keep-on for sensor monitoring")
             Log.i(TAG, "Monitoring STARTED. Using RotationVector: $usingRotationVector")
         } else {
             // This case should ideally be caught by checkSensorAvailability, but as a safeguard:
@@ -245,12 +298,17 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         // Stop all alerts
         stopAllAlerts()
         
+        // Release wake lock and screen flag
+        wakeLock?.release()
+        wakeLock = null
+        window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        Log.i(TAG, "Wake lock and screen flag released")
+        
         // Reset UI
         statusTextView.text = "Status: Idle"
         orientationTextView.text = "Roll: N/A"
         startStopButton.text = "Start Monitoring"
-        instructionTextView.text = "Place phone on chest, screen up.\nTap Start to monitor."
-        // Screen is already allowed to turn off (no flag to clear)
+        instructionTextView.text = "Place phone on chest, screen facing your body.\nTap Start to monitor."
         // Reset sensor data buffers
         gravity = null
         geomagnetic = null
@@ -308,6 +366,11 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
             val rollDegrees = Math.toDegrees(currentRollRadians.toDouble())
             val pitchDegrees = Math.toDegrees(currentPitchRadians.toDouble())
             val azimuthDegrees = Math.toDegrees(currentAzimuthRadians.toDouble())
+            
+            // Store last known values for data collection
+            lastKnownRoll = currentRollRadians
+            lastKnownPitch = currentPitchRadians
+            lastKnownAzimuth = currentAzimuthRadians
 
             // Log detailed orientation data
             Log.v(TAG, String.format( // Using Verbose level for frequent data
@@ -321,14 +384,18 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                 rollDegrees, currentRollRadians, pitchDegrees
             )
 
-            // --- Stomach Detection Logic (Based on Roll) ---
-            if (abs(currentRollRadians) > STOMACH_ROLL_THRESHOLD_RADIANS) {
+            // --- Stomach Detection Logic (Based on Data Analysis) ---
+            // Dangerous when pitch is positive (tilted forward toward stomach)
+            // Safe when pitch is negative (tilted back)
+            val isDangerous = currentPitchRadians > STOMACH_PITCH_THRESHOLD_RADIANS
+            
+            if (isDangerous) {
                 if (!isInDangerousPosition) {
                     // Just entered dangerous position
                     isInDangerousPosition = true
                     alertStartTime = System.currentTimeMillis()
                     statusTextView.text = "Status: ON STOMACH!"
-                    Log.i(TAG, "ON STOMACH detected (Roll: ${rollDegrees}°, Threshold: >${Math.toDegrees(STOMACH_ROLL_THRESHOLD_RADIANS.toDouble())}°)")
+                    Log.i(TAG, "ON STOMACH detected (Pitch: ${pitchDegrees}°, Roll: ${rollDegrees}°)")
                     startContinuousAlerts()
                 }
             } else {
@@ -337,7 +404,7 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
                     isInDangerousPosition = false
                     stopAllAlerts()
                     statusTextView.text = "Status: Monitoring..."
-                    Log.i(TAG, "Off stomach (Roll: ${rollDegrees}°)")
+                    Log.i(TAG, "Safe position (Pitch: ${pitchDegrees}°, Roll: ${rollDegrees}°)")
                 }
             }
         }
@@ -439,5 +506,55 @@ class MainActivity : AppCompatActivity(), SensorEventListener {
         alertStartTime = 0
         
         Log.d(TAG, "All alerts stopped")
+    }
+    
+    // --- Data Collection Methods ---
+    private fun collectDataPoint(isSafe: Boolean) {
+        // Get current sensor readings if available
+        val currentTime = System.currentTimeMillis()
+        
+        // We need current orientation values - let's store the last known values
+        val lastRoll = lastKnownRoll ?: 0f
+        val lastPitch = lastKnownPitch ?: 0f
+        val lastAzimuth = lastKnownAzimuth ?: 0f
+        
+        val dataPoint = SensorData(lastRoll, lastPitch, lastAzimuth, currentTime)
+        
+        if (isSafe) {
+            safePositionData.add(dataPoint)
+            Log.i(TAG, "Safe data collected: Roll=${lastRoll}, Pitch=${lastPitch}, Azimuth=${lastAzimuth}")
+        } else {
+            riskyPositionData.add(dataPoint)
+            Log.i(TAG, "Risky data collected: Roll=${lastRoll}, Pitch=${lastPitch}, Azimuth=${lastAzimuth}")
+        }
+        
+        updateDataCountDisplay()
+        printDataAnalysis()
+    }
+    
+    private fun updateDataCountDisplay() {
+        dataCountTextView.text = "Data points: ${safePositionData.size} safe, ${riskyPositionData.size} risky"
+    }
+    
+    private fun printDataAnalysis() {
+        if (safePositionData.isNotEmpty() && riskyPositionData.isNotEmpty()) {
+            Log.i(TAG, "=== DATA ANALYSIS ===")
+            
+            // Safe position statistics
+            val safeRolls = safePositionData.map { it.roll }
+            val safePitches = safePositionData.map { it.pitch }
+            Log.i(TAG, "Safe positions:")
+            Log.i(TAG, "  Roll: min=${safeRolls.minOrNull()}, max=${safeRolls.maxOrNull()}, avg=${safeRolls.average()}")
+            Log.i(TAG, "  Pitch: min=${safePitches.minOrNull()}, max=${safePitches.maxOrNull()}, avg=${safePitches.average()}")
+            
+            // Risky position statistics
+            val riskyRolls = riskyPositionData.map { it.roll }
+            val riskyPitches = riskyPositionData.map { it.pitch }
+            Log.i(TAG, "Risky positions:")
+            Log.i(TAG, "  Roll: min=${riskyRolls.minOrNull()}, max=${riskyRolls.maxOrNull()}, avg=${riskyRolls.average()}")
+            Log.i(TAG, "  Pitch: min=${riskyPitches.minOrNull()}, max=${riskyPitches.maxOrNull()}, avg=${riskyPitches.average()}")
+            
+            Log.i(TAG, "=== END ANALYSIS ===")
+        }
     }
 }

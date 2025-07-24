@@ -38,6 +38,47 @@
     android:text="Place phone on chest, screen up.\nTap Start to monitor."
     android:textAppearance="?android:attr/textAppearanceSmall" />
 
+    <LinearLayout
+        android:id="@+id/dataCollectionLayout"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_below="@+id/instructionTextView"
+        android:layout_marginTop="20dp"
+        android:orientation="horizontal"
+        android:gravity="center">
+
+        <Button
+            android:id="@+id/safePositionButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginEnd="8dp"
+            android:backgroundTint="#4CAF50"
+            android:text="Safe Position"
+            android:textColor="@android:color/white" />
+
+        <Button
+            android:id="@+id/riskyPositionButton"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="8dp"
+            android:backgroundTint="#F44336"
+            android:text="Risky Position"
+            android:textColor="@android:color/white" />
+
+    </LinearLayout>
+
+    <TextView
+        android:id="@+id/dataCountTextView"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_below="@+id/dataCollectionLayout"
+        android:layout_centerHorizontal="true"
+        android:layout_marginTop="10dp"
+        android:text="Data points: 0 safe, 0 risky"
+        android:textAppearance="?android:attr/textAppearanceSmall" />
+
     <Button
         android:id="@+id/startStopButton"
         android:layout_width="wrap_content"

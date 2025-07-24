@@ -4,7 +4,8 @@
       "Bash(find:*)",
       "Bash(ls:*)",
       "Bash(./gradlew:*)",
-      "Bash(adb uninstall:*)"
+      "Bash(adb uninstall:*)",
+      "Bash(grep:*)"
     ],
     "deny": []
   }
